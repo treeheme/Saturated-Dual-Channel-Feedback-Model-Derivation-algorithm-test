@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""
+Gain-matched control: is the c>0 effect just a higher effective gain?
+
+For each seed, run c=8. Then run c=0 with both incoming channels scaled by a
+factor k, chosen by bisection so the mean Lambda equals the c=8 run's mean
+Lambda. If c=8 still differs from this control, the channel interaction does
+something beyond a gain change.
+"""
+import numpy as np, pandas as pd
+from scipy.stats import t as student_t
+from sdcf_network_experiment import make_forcing, integrate_sdcf
+
+def metrics(e, lam):
+    return dict(mean_E=e.mean(), max_E=e.max(), std_E=e.std(),
+                mean_abs_dE_dt=np.abs(np.diff(e, axis=0) / 0.1).mean(),
+                mean_lambda=lam.mean())
+
+rows = []
+for interp, ew in [("information_only", False), ("energy_weighted_information", True)]:
+    for seed in range(8):
+        times, p, cap, a, b, _ = make_forcing(seed, ew, 1.5)
+        e0, l0, _ = integrate_sdcf(times, p, cap, a, b, 0.0)
+        e8, l8, _ = integrate_sdcf(times, p, cap, a, b, 8.0)
+        target = l8.mean()
+        lo, hi = 0.5, 3.0
+        for _ in range(60):
+            k = 0.5 * (lo + hi)
+            _, lk, _ = integrate_sdcf(times, p, cap, k * a, k * b, 0.0)
+            lo, hi = (k, hi) if lk.mean() < target else (lo, k)
+        ek, lk, _ = integrate_sdcf(times, p, cap, k * a, k * b, 0.0)
+        for name, e, l in [("c0_baseline", e0, l0), ("c8", e8, l8), ("c0_gain_matched", ek, lk)]:
+            rows.append(dict(interpretation=interp, seed=seed, arm=name, k=k if name == "c0_gain_matched" else 1.0,
+                             **metrics(e, l)))
+
+df = pd.DataFrame(rows)
+df.to_csv("results/gain_control.csv", index=False)
+pd.set_option("display.width", 200)
+print(df.groupby(["interpretation", "arm"])[["k", "mean_lambda", "mean_E", "max_E", "std_E", "mean_abs_dE_dt"]].mean().round(6))
+
+print("\nPaired: c8 minus gain-matched c0 (95% CI)")
+for interp, g in df.groupby("interpretation"):
+    for m in ["mean_E", "max_E", "std_E", "mean_abs_dE_dt"]:
+        d = (g[g.arm == "c8"].set_index("seed")[m] - g[g.arm == "c0_gain_matched"].set_index("seed")[m])
+        se = d.std(ddof=1) / np.sqrt(len(d)); tc = student_t.ppf(0.975, len(d) - 1)
+        print(f"{interp:28s} {m:15s} {d.mean():+.6f}  [{d.mean()-tc*se:+.6f}, {d.mean()+tc*se:+.6f}]")
