@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""
+Divide-and-conquer information distribution on the 4-node ring (LATENCY ONLY,
+no SDCF equation in this test).
+
+Arms (all queues are served most-important-first; all see identical messages):
+  whole_shortest : whole message, shortest path
+  whole_adaptive : whole message, path with lower estimated delay
+  dnc_chunks     : DIVIDE the message by recursive halving into small chunks,
+                   send chunks over BOTH ring directions, balancing by
+                   estimated completion time; the message is complete when
+                   its last chunk arrives (reassembly = counting chunks,
+                   no sort-merge step).
+Routing is decided at the source; chunks already queued cannot reroute.
+"""
+import heapq, argparse
+import numpy as np, pandas as pd
+from scipy.stats import t as student_t
+from sdcf_network_experiment import make_forcing, N_NODES, DT, OUTAGES
+
+BW, TRANSIT, DOWN_PEN, CH, MEAN_SIZE = 1.0, 1.5, 15.0, 0.25, 1.0
+ARMS = ["whole_shortest", "whole_adaptive", "dnc_chunks"]
+LINKS = [(i, (i + d) % N_NODES) for i in range(N_NODES) for d in (1, -1)]
+
+
+def link_up(i, j, t):
+    return not any(s <= t < e and target in (i, j) for s, e, target in OUTAGES)
+
+
+def ring_path(src, dst, step):
+    links, n = [], src
+    while n != dst:
+        m = (n + step) % N_NODES
+        links.append((n, m)); n = m
+    return tuple(links)
+
+
+def generate(seed, q, times):
+    rng = np.random.default_rng(7000 + seed)
+    gen = [[] for _ in times]; mid = 0
+    for k, t in enumerate(times):
+        for i in range(N_NODES):
+            for _ in range(rng.poisson(q[k, i] * DT / MEAN_SIZE)):
+                dst = (i + int(rng.choice([1, -1, 2]))) % N_NODES
+                gen[k].append((mid, i, dst, rng.uniform(0.5, 1.5), rng.uniform(0.5, 1.5),
+                               t + rng.uniform(10, 45)))
+                mid += 1
+    return gen
+
+
+def split_chunks(size):
+    """Divide step: recursive halving until chunks are small."""
+    if size <= CH * 1.0001:
+        return [size]
+    return split_chunks(size / 2) + split_chunks(size / 2)
+
+
+def simulate(arm, times, gen):
+    nt = len(times); dsteps = int(round(TRANSIT / DT))
+    heaps = {l: [] for l in LINKS}; qsize = {l: 0.0 for l in LINKS}; credit = {l: 0.0 for l in LINKS}
+    inflight = [[] for _ in range(nt + dsteps + 2)]
+    state = {}; uid = [0]
+
+    def est(path, extra, t):
+        return sum((qsize[l] + extra.get(l, 0.0)) / BW + TRANSIT + (DOWN_PEN if not link_up(*l, t) else 0.0)
+                   for l in path)
+
+    def enqueue(l, value, born, msg, size, path, hop):
+        uid[0] += 1
+        heapq.heappush(heaps[l], (-value, born, uid[0], msg, size, path, hop)); qsize[l] += size
+
+    for k, t in enumerate(times):
+        for (value, born, u, msg, size, path, hop) in inflight[k]:
+            if hop + 1 == len(path):
+                state[msg]["left"] -= 1
+                if state[msg]["left"] == 0:
+                    state[msg]["done"] = t
+            else:
+                enqueue(path[hop + 1], value, born, msg, size, path, hop + 1)
+        for (mid, src, dst, size, value, deadline) in gen[k]:
+            cw, ccw = ring_path(src, dst, 1), ring_path(src, dst, -1)
+            chunks = split_chunks(size) if arm == "dnc_chunks" else [size]
+            state[mid] = dict(born=t, value=value, deadline=deadline, left=len(chunks), done=None)
+            extra = {}
+            for c in chunks:
+                if arm == "whole_shortest":
+                    path = cw if (len(cw) < len(ccw) or (len(cw) == len(ccw) and mid % 2 == 0)) else ccw
+                else:
+                    path = cw if est(cw, extra, t) + 0.0 <= est(ccw, extra, t) else ccw
+                for l in path:
+                    extra[l] = extra.get(l, 0.0) + c
+                enqueue(path[0], value, t, mid, c, path, 0)
+        for l in LINKS:
+            if not link_up(*l, t):
+                credit[l] = 0.0; continue
+            credit[l] = min(credit[l] + BW * DT, 1.6)
+            h = heaps[l]
+            while h and credit[l] >= h[0][4]:
+                nv, born, u, msg, size, path, hop = heapq.heappop(h)
+                credit[l] -= size; qsize[l] -= size
+                inflight[k + dsteps].append((-nv, born, u, msg, size, path, hop))
+    lat, hi, ontime, done = [], [], 0, 0
+    for m in state.values():
+        if m["done"] is not None:
+            done += 1; L = m["done"] - m["born"]; lat.append(L)
+            if m["value"] > 1.17: hi.append(L)
+            ontime += m["done"] <= m["deadline"]
+    n = len(state)
+    return dict(messages=n, completed_pct=100 * done / n, mean_latency=np.mean(lat),
+                p95_latency=np.quantile(lat, 0.95), high_importance_latency=np.mean(hi),
+                on_time_pct=100 * ontime / n)
+
+
+def ci(d):
+    se = d.std(ddof=1) / np.sqrt(len(d)); tc = student_t.ppf(0.975, len(d) - 1)
+    return f"{d.mean():+.3f} [{d.mean()-tc*se:+.3f}, {d.mean()+tc*se:+.3f}]"
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("--seeds", type=int, default=8)
+    ap.add_argument("--out", default="results/dnc_information_layer.csv"); a = ap.parse_args()
+    rows = []
+    for seed in range(a.seeds):
+        times, _, _, _, _, q = make_forcing(seed, False, 1.5)
+        gen = generate(seed, q, times)
+        for arm in ARMS:
+            rows.append(dict(seed=seed, arm=arm, **simulate(arm, times, gen)))
+        print(f"seed {seed+1}/{a.seeds}", flush=True)
+    df = pd.DataFrame(rows); df.to_csv(a.out, index=False)
+    pd.set_option("display.width", 200)
+    cols = ["completed_pct", "mean_latency", "p95_latency", "high_importance_latency", "on_time_pct"]
+    print(df.groupby("arm")[cols].mean().reindex(ARMS).round(3))
+    S = lambda arm, m: df[df.arm == arm].set_index("seed")[m]
+    print("\nPaired vs whole_shortest (95% CI)")
+    for arm in ARMS[1:]:
+        for m in ["mean_latency", "p95_latency", "high_importance_latency", "on_time_pct"]:
+            print(f"{arm:15s} {m:24s} {ci(S(arm, m) - S('whole_shortest', m))}")
+    print("\ndnc_chunks vs whole_adaptive (isolates the divide step)")
+    for m in ["mean_latency", "p95_latency", "high_importance_latency", "on_time_pct"]:
+        print(f"{m:24s} {ci(S('dnc_chunks', m) - S('whole_adaptive', m))}")
