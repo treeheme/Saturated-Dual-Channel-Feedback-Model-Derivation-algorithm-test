@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""
+Ring-laser test of the SDCF structure (class-B laser, time in units of the
+inversion lifetime). TWO counter-propagating beams I1 (cw), I2 (ccw) share ONE
+inversion reservoir N (= SDCF's E). Pump = P(t) with noise and full outages.
+
+Beams (all arms):  dIj/dt = kappa*(N-1)*Ij + sp*N - b*(Ij - I_other) + noise
+Reservoir arms:
+  A_standard   : dN/dt = P - N - N*(I1+I2)                      (textbook)
+  B_sdcf       : dN/dt = P - alpha*N*P*C^3*Lambda(z)            (your equation as is)
+  C_sdcf_leak  : dN/dt = P - alpha*N*P*C^3*Lambda(z) - N        (+ spontaneous decay)
+with  z = I1*u^(tau+c*x) + I2*u^(tau-c*x),  x=(I1-I2)/(I1+I2),  Lambda=z/(1+beta*z),
+tau = t/60.  Here the beam intensities play the role of S and B.
+C is tuned so every arm has the same nominal operating point (I1+I2 = P0-1).
+Assumptions: shared (homogeneous) inversion, incoherent backscatter, no phase.
+"""
+import numpy as np, pandas as pd
+from scipy.ndimage import uniform_filter1d
+
+ALPHA, BETA, U, TS, EPS = 0.90, 0.75, 1.03, 60.0, 1e-12
+KAPPA, SP, BACK = 40.0, 1e-3, 0.05
+P0, DT, DUR, DEC = 3.0, 0.005, 240.0, 10
+WINDOWS = [(55.0, 76.0), (116.0, 139.0), (179.0, 201.0)]
+NS = 16
+Z0 = P0 - 1.0
+LAM0 = Z0 / (1 + BETA * Z0)
+C3 = {"B_sdcf": 1.0 / (ALPHA * LAM0), "C_sdcf_leak": (1 - 1 / P0) / (ALPHA * LAM0)}
+
+
+def lam_x(t, I1, I2, c):
+    x = (I1 - I2) / (I1 + I2 + EPS); tau = t / TS
+    z = I1 * U ** (tau + c * x) + I2 * U ** (tau - c * x)
+    return z / (1 + BETA * z), x
+
+
+def rhs(arm, c, t, N, I1, I2, P):
+    dI = lambda a, o: KAPPA * (N - 1) * a + SP * N - BACK * (a - o)
+    if arm == "A_standard":
+        dN = P - N - N * (I1 + I2)
+    else:
+        lam, _ = lam_x(t, I1, I2, c)
+        dN = P - ALPHA * N * P * C3[arm] * lam - (N if arm == "C_sdcf_leak" else 0.0)
+    return dN, dI(I1, I2), dI(I2, I1)
+
+
+def run(arm, c, seed0=0):
+    rng = np.random.default_rng(100 + seed0)
+    nt = int(round(DUR / DT)); t_arr = np.arange(nt + 1) * DT
+    # pump: OU noise (3 %, corr. time 2) and outages
+    ou = np.zeros((nt + 1, NS)); a = DT / 2.0
+    for k in range(nt):
+        ou[k + 1] = ou[k] - a * ou[k] + 0.03 * np.sqrt(2 * a) * rng.standard_normal(NS)
+    P = P0 * (1 + ou)
+    for s, e in WINDOWS:
+        P[(t_arr >= s) & (t_arr < e)] = 0.0
+    N = np.full(NS, 1.0); I1 = np.full(NS, 1.2); I2 = np.full(NS, 0.8)
+    rec = np.zeros((nt // DEC + 1, 4, NS)); dE = np.zeros(NS); dEn = 0
+    for k in range(nt):
+        t = t_arr[k]; p = P[k]
+        if k % DEC == 0:
+            rec[k // DEC] = [N, I1, I2, p]
+        k1 = rhs(arm, c, t, N, I1, I2, p)
+        k2 = rhs(arm, c, t + DT / 2, N + DT / 2 * k1[0], I1 + DT / 2 * k1[1], I2 + DT / 2 * k1[2], p)
+        k3 = rhs(arm, c, t + DT / 2, N + DT / 2 * k2[0], I1 + DT / 2 * k2[1], I2 + DT / 2 * k2[2], p)
+        k4 = rhs(arm, c, t + DT, N + DT * k3[0], I1 + DT * k3[1], I2 + DT * k3[2], p)
+        dN = DT / 6 * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0])
+        N = np.maximum(0, N + dN); dE += np.abs(dN) / DT; dEn += 1
+        I1 = np.maximum(1e-6, I1 + DT / 6 * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1]) + 0.05 * np.sqrt(I1 * DT) * rng.standard_normal(NS))
+        I2 = np.maximum(1e-6, I2 + DT / 6 * (k1[2] + 2 * k2[2] + 2 * k3[2] + k4[2]) + 0.05 * np.sqrt(I2 * DT) * rng.standard_normal(NS))
+    rec[-1] = [N, I1, I2, P[-1]]
+    return np.arange(rec.shape[0]) * DT * DEC, rec, dE / dEn
+
+
+def metrics(t, rec, mean_dN):
+    N, I1, I2 = rec[:, 0], rec[:, 1], rec[:, 2]; It = I1 + I2
+    x = np.abs((I1 - I2) / (It + EPS))
+    steady = (t > 25)
+    for s, e in WINDOWS:
+        steady &= ~((t >= s) & (t < e + 25))
+    base = uniform_filter1d(It, size=100, axis=0, mode="nearest")
+    rin = ((It - base)[steady].std(axis=0) / It[steady].mean(axis=0))
+    over, during, rect = [], [], []
+    for s, e in WINDOWS:
+        pre = It[(t >= s - 10) & (t < s)].mean(axis=0)
+        over.append(It[(t >= e) & (t < e + 15)].max(axis=0) / pre)
+        during.append(It[(t >= s + 2) & (t < e)].mean(axis=0) / pre)
+        seg = (t >= e) & (t < e + 40); ts = t[seg]; ok = np.abs(It[seg] / pre - 1) < 0.1
+        r = np.full(NS, 40.0)
+        for j in range(NS):
+            for i in range(len(ts)):
+                if ok[i:i + 100, j].all():
+                    r[j] = ts[i] - e; break
+        rect.append(r)
+    return dict(RIN_pct=100 * rin.mean(), overshoot_ratio=np.mean(over), output_during_outage_ratio=np.mean(during),
+                recovery_time=np.mean(rect), mean_abs_x=x[steady].mean(), mean_abs_dN_dt=float(mean_dN.mean()),
+                mean_N_steady=N[steady].mean(), mean_I_steady=It[steady].mean())
+
+
+if __name__ == "__main__":
+    rows = []
+    for arm, c in [("A_standard", 0.0), ("B_sdcf", 0.0), ("B_sdcf", 8.0), ("C_sdcf_leak", 0.0), ("C_sdcf_leak", 8.0)]:
+        t, rec, md = run(arm, c)
+        rows.append(dict(arm=arm, c=c, **metrics(t, rec, md)))
+        np.save(f"results/ringlaser_{arm}_c{int(c)}.npy", rec[:, :, 0])   # seed 0 trajectory
+        print("done", arm, c, flush=True)
+    df = pd.DataFrame(rows); df.to_csv("results/ring_laser_metrics.csv", index=False)
+    pd.set_option("display.width", 220); pd.set_option("display.max_columns", 20)
+    print(df.round(4).to_string(index=False))
