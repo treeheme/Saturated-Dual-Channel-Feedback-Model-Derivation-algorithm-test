@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""
+Fuller semiclassical ring laser (complex fields, inversion grating, backscatter
+with phase, rotation/Sagnac splitting, complex noise), with the SDCF arms.
+
+Fields E1 (cw), E2 (ccw); inversion D(z)=D0 + Dg e^{2ikz} + c.c. (mean + grating):
+  dE1/dt = k[(D0-1)E1 + Dg E2] + r e^{i z1} E2 + i(Om/2)E1
+  dE2/dt = k[(D0-1)E2 + conj(Dg) E1] + r e^{i z2} E1 - i(Om/2)E2
+  (backscatter coefficients with independent phases, as in ring-laser gyro theory;
+   lock-in threshold ~ 2 r cos((z1+z2)/2) = 0.19 here)
+  dDg/dt = -(1+d)Dg - D0 E1 conj(E2) - Dg (I1+I2)            (d = grating wash-out)
+  A (textbook):  dD0/dt = P - D0 - D0 It - 2Re(Dg conj(E1 conj(E2)))
+  B: dD0/dt = P - alpha D0 P C^3 Lambda(z)            C: B - D0 (decay)
+  D: C plus extra loss k*sig*(w_j-1)*I_j on beam j, w1=u^(c x), w2=u^(-c x)  [my construction]
+  E: energy-consistent: B's reservoir, but the field gain is FUELLED BY THE DRAIN:
+     G = zeta*Drain/(2(It+I0)) replaces k(D0-1)... (photons only appear when the
+     reservoir is actually drained)                                          [my construction]
+Lambda(z)=z/(1+beta z), z = I1 u^(tau+c x) + I2 u^(tau-c x), tau=t/60.
+Metrics use the same pump (3 % noise + three full outages) as before.
+"""
+import sys, numpy as np, pandas as pd
+from scipy.ndimage import uniform_filter1d
+
+ALPHA, BETA, U, TS, EPS = 0.90, 0.75, 1.03, 60.0, 1e-12
+KAPPA, R_BS, Z1, Z2, SIG = 40.0, 0.10, 0.3, 0.3, 0.10
+P0, DT, DEC = 3.0, 0.005, 10
+WINDOWS = [(55.0, 76.0), (116.0, 139.0), (179.0, 201.0)]
+NS = 6
+ZETA = 2 * KAPPA * (P0 - 1) / P0   # sets E-arm output to P0-1 at nominal pump
+I_FLOOR = 1e-3
+
+
+def lam_x(t, I1, I2, c):
+    x = (I1 - I2) / (I1 + I2 + EPS); tau = t / TS
+    z = I1 * U ** (tau + c * x) + I2 * U ** (tau - c * x)
+    return z / (1 + BETA * z), x
+
+
+def rhs(arm, c, par, C3, t, E1, E2, D0, Dg, P):
+    I1, I2 = np.abs(E1) ** 2, np.abs(E2) ** 2; It = I1 + I2
+    A = E1 * np.conj(E2)
+    ex1 = ex2 = 0.0
+    lam, x = lam_x(t, I1, I2, c)
+    if arm == "A":
+        dD0 = P - D0 - D0 * It - 2 * np.real(Dg * np.conj(A)); g = KAPPA * (D0 - 1)
+    elif arm == "B":
+        dD0 = P - ALPHA * D0 * P * C3["B"] * lam; g = KAPPA * (D0 - 1)
+    elif arm in ("C", "D"):
+        dD0 = P - ALPHA * D0 * P * C3["C"] * lam - D0; g = KAPPA * (D0 - 1)
+        if arm == "D":
+            w1, w2 = U ** (c * x), U ** (-c * x)
+            ex1, ex2 = KAPPA * SIG * (w1 - 1) * I1, KAPPA * SIG * (w2 - 1) * I2
+    else:  # E
+        drain = ALPHA * D0 * P * C3["B"] * lam
+        dD0 = P - drain; g = ZETA * drain / (2 * (It + I_FLOOR)) - KAPPA
+        g = g + KAPPA   # so that (g - kappa) below is G - kappa
+    dDg = -(1 + par["d"]) * Dg - D0 * A - Dg * It
+    if arm == "E":
+        gain = g - KAPPA
+    else:
+        gain = g
+    om = par["Om"] / 2
+    dE1 = gain * E1 + KAPPA * Dg * E2 + R_BS * np.exp(1j * Z1) * E2 + 1j * om * E1 - ex1 * E1
+    dE2 = gain * E2 + KAPPA * np.conj(Dg) * E1 + R_BS * np.exp(1j * Z2) * E1 - 1j * om * E2 - ex2 * E2
+    if arm != "E":
+        pass
+    return dE1, dE2, dD0, dDg
+
+
+def integrate(arm, c, par, C3, dur, noise=True, outages=True, ns=NS, seed=0, init=None):
+    rng = np.random.default_rng(500 + seed)
+    nt = int(round(dur / DT)); t_arr = np.arange(nt + 1) * DT
+    ou = np.zeros((nt + 1, ns)); a = DT / 2.0
+    if noise:
+        for k in range(nt):
+            ou[k + 1] = ou[k] - a * ou[k] + 0.03 * np.sqrt(2 * a) * rng.standard_normal(ns)
+    P = P0 * (1 + ou)
+    if outages:
+        for s, e in WINDOWS: P[(t_arr >= s) & (t_arr < e)] = 0.0
+    D0i, Iti = init
+    E1 = np.full(ns, np.sqrt(0.6 * Iti) + 0j); E2 = np.full(ns, np.sqrt(0.4 * Iti) * np.exp(1j * np.pi / 3))
+    D0 = np.full(ns, D0i); Dg = np.zeros(ns, dtype=complex)
+    rec = np.zeros((nt // DEC + 1, 4, ns), dtype=complex)
+    for k in range(nt):
+        t = t_arr[k]; p = P[k]
+        if k % DEC == 0: rec[k // DEC] = [E1, E2, D0, Dg]
+        f = lambda e1, e2, d0, dg, tt: rhs(arm, c, par, C3, tt, e1, e2, d0, dg, p)
+        k1 = f(E1, E2, D0, Dg, t)
+        k2 = f(E1 + DT / 2 * k1[0], E2 + DT / 2 * k1[1], D0 + DT / 2 * k1[2], Dg + DT / 2 * k1[3], t + DT / 2)
+        k3 = f(E1 + DT / 2 * k2[0], E2 + DT / 2 * k2[1], D0 + DT / 2 * k2[2], Dg + DT / 2 * k2[3], t + DT / 2)
+        k4 = f(E1 + DT * k3[0], E2 + DT * k3[1], D0 + DT * k3[2], Dg + DT * k3[3], t + DT)
+        E1 = E1 + DT / 6 * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0])
+        E2 = E2 + DT / 6 * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1])
+        D0 = np.maximum(0, D0 + DT / 6 * (k1[2] + 2 * k2[2] + 2 * k3[2] + k4[2]))
+        Dg = Dg + DT / 6 * (k1[3] + 2 * k2[3] + 2 * k3[3] + k4[3])
+        if noise:
+            sq = 0.03 * np.sqrt(DT)
+            E1 = E1 + sq * (rng.standard_normal(ns) + 1j * rng.standard_normal(ns))
+            E2 = E2 + sq * (rng.standard_normal(ns) + 1j * rng.standard_normal(ns))
+    rec[-1] = [E1, E2, D0, Dg]
+    return np.arange(rec.shape[0]) * DT * DEC, rec
+
+
+def tune(par):
+    """Operating point from a deterministic textbook run; then tune C^3 for B, C."""
+    t, rec = integrate("A", 0.0, par, None, 80.0, noise=False, outages=False, ns=1, init=(1.0, 1.5))
+    D0 = float(rec[-1, 2, 0].real); It = float(abs(rec[-1, 0, 0]) ** 2 + abs(rec[-1, 1, 0]) ** 2)
+    lam0 = It / (1 + BETA * It)
+    return dict(B=1 / (ALPHA * D0 * lam0), C=(P0 - D0) / (ALPHA * D0 * P0 * lam0)), (D0, It)
+
+
+def metrics(t, rec, par):
+    E1, E2 = rec[:, 0], rec[:, 1]; I1, I2 = np.abs(E1) ** 2, np.abs(E2) ** 2; It = I1 + I2
+    x = (I1 - I2) / (It + EPS)
+    steady = (t > 25)
+    for s, e in WINDOWS: steady &= ~((t >= s) & (t < e + 25))
+    base = uniform_filter1d(It, size=100, axis=0, mode="nearest")
+    rin = 100 * ((It - base)[steady].std(axis=0) / It[steady].mean(axis=0)).mean()
+    during = []
+    sw = nd = 0
+    for s, e in WINDOWS:
+        pre = It[(t >= s - 10) & (t < s)].mean(axis=0)
+        during.append((It[(t >= s + 2) & (t < e)].mean(axis=0) / pre).mean())
+        px = x[(t >= s - 10) & (t < s)].mean(axis=0); qx = x[(t >= e + 20) & (t < e + 35)].mean(axis=0)
+        ok = (np.abs(px) > 0.5) & (np.abs(qx) > 0.5)
+        sw += int((np.sign(px[ok]) != np.sign(qx[ok])).sum()); nd += int(ok.sum())
+    # beat frequency (only meaningful when both beams present)
+    ang = np.unwrap(np.angle(E1 * np.conj(E2)), axis=0)
+    seg = (t > 25) & (t < 52)
+    beat = ((ang[seg][-1] - ang[seg][0]) / (t[seg][-1] - t[seg][0]))
+    both = (np.abs(x[seg]).mean(axis=0) < 0.5)
+    ratio = float(np.mean(beat[both]) / par["Om"]) if (both.any() and par["Om"] != 0) else np.nan
+    return dict(mean_abs_x=float(np.abs(x[steady]).mean()), RIN_pct=float(rin),
+                output_during_outage=float(np.mean(during)), outage_switch_rate=(sw / nd if nd else np.nan),
+                beat_over_rotation=ratio, mean_I=float(It[steady].mean()))
+
+
+SCEN = {"strong_grating_no_rotation": dict(d=0.0, Om=0.0),
+        "washed_grating_rotation": dict(d=300.0, Om=0.15)}
+ARMS = [("A", 0.0), ("B", 0.0), ("B", 8.0), ("C", 0.0), ("C", 8.0), ("D", 16.0), ("E", 8.0)]
+
+if __name__ == "__main__":
+    which = sys.argv[1]; par = SCEN[which]
+    C3, init = tune(par)
+    print(f"[{which}] operating point D0={init[0]:.3f} I_total={init[1]:.3f}; C^3: {C3}", flush=True)
+    rows = []
+    for arm, c in ARMS:
+        t, rec = integrate(arm, c, par, C3, 240.0, init=init)
+        rows.append(dict(scenario=which, arm=arm, c=c, **metrics(t, rec, par)))
+        print("  done", arm, c, flush=True)
+    df = pd.DataFrame(rows); df.to_csv(f"results/ring_laser_full_{which}.csv", index=False)
+    pd.set_option("display.width", 220); pd.set_option("display.max_columns", 20)
+    print(df.round(3).to_string(index=False))
