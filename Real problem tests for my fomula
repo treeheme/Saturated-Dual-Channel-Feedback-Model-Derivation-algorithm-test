@@ -1,81 +1,172 @@
 #!/usr/bin/env python3
 """
-Advanced Ring Laser Gyroscope Simulation (Stress Test: BACK_SCATTER = 0.2)
-Tests whether the SDCF-driven frequency bias can survive extreme mirror backscattering.
+FULL-LASER STRESS TEST (Standalone Version)
+Adaptive backscatter cancellation (your SDCF equation as the update law)
+versus dither, constant bias, no control, and fixed calibration, under BACKSCATTER DRIFT.
 """
 import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
 
-# Parameters
-ALPHA, BETA, U, TS, EPS = 0.90, 0.75, 1.03, 60.0, 1e-12
-KAPPA, SP = 40.0, 1e-3
-BACK_SCATTER = 0.20  # EXTREME Backscattering coupling strength (heavy lock-in pressure)
-ROTATION_RATE = 0.02 # Sagnac frequency split input
-BIAS_GAIN = 0.5      # Strength of SDCF-driven frequency bias coupling
-P0, DT, DUR = 3.0, 0.001, 100.0
+# --- SYSTEM & SIMULATION CONSTANTS ---
+P0 = 3.0
+DT = 0.001
+DEC = 10
+ALPHA, BETA, C3 = 0.90, 0.75, 1.5
 
-def run_stress_test(c_val=8.0):
+def OMEGA_L(r):
+    return 2.0 * r * np.cos(0.3)
+
+OM_NOM = OMEGA_L(0.1)                    # 0.1910 : normalisation for the adaptive loop
+TW, GAMMA, KG, PROBE_A = 10.0, 0.5, 0.5 / 0.08, 0.5 * OM_NOM
+NS, DUR, T_DRIFT = 4, 200.0, 60.0
+WINS = [("t 40-60 (r=0.1)", 40, 60), ("t 100-130 (r=0.2)", 100, 130), ("t 170-200 (r=0.2)", 170, 200)]
+
+# --- PLANT PHYSICS (Ring Laser Full Model) ---
+def plant(t, E1, E2, D0, Dg, p, Om, r):
+    # Field equations with inversion grating, self-saturation, and backscatter
+    I1 = np.abs(E1)**2
+    I2 = np.abs(E2)**2
+    
+    # Gain dynamics with population inversion D0 and spatial grating Dg
+    dD0_dt = p - D0 * (1.0 + 0.05 * (I1 + I2)) - (Dg * E1 * np.conj(E2) + np.conj(Dg) * E2 * np.conj(E1)).real
+    dDg_dt = -0.05 * D0 * (E2 * np.conj(E1)) - 300.0 * Dg + p * 0.0
+    
+    # Coupled laser fields
+    kappa = 40.0
+    dE1_dt = 0.5 * (kappa * ((D0 - 1.0) * E1 + Dg * E2) + 1j * Om * E1) + r * E2 * np.exp(1j * 0.3)
+    dE2_dt = 0.5 * (kappa * ((D0 - 1.0) * E2 + np.conj(Dg) * E1) - 1j * Om * E2) + r * E1 * np.exp(1j * 0.3)
+    
+    return (dE1_dt, dE2_dt, dD0_dt, dDg_dt)
+
+def lam_target(m_norm):
+    lt = min(1.0 / (ALPHA * C3 * m_norm), 0.98 / BETA)
+    z = lt / (1.0 - BETA * lt)
+    return z / (1.0 + BETA * z)
+
+
+def run(arm, omega, seed):
+    rng = np.random.default_rng(1200 + seed)
     nt = int(round(DUR / DT))
     t_arr = np.arange(nt + 1) * DT
     
-    E1 = np.zeros(nt + 1, dtype=complex)
-    E2 = np.zeros(nt + 1, dtype=complex)
-    N = np.zeros(nt + 1)
+    ou = np.zeros((nt + 1, NS))
+    a = DT / 2.0
+    for k in range(nt):
+        ou[k + 1] = ou[k] - a * ou[k] + 0.03 * np.sqrt(2 * a) * rng.standard_normal(NS)
+    Pump = P0 * (1.0 + ou)
     
-    E1[0] = np.sqrt(1.2) * np.exp(1j * 0.0)
-    E2[0] = np.sqrt(0.8) * np.exp(1j * 0.0)
-    N[0] = 1.0
+    E1 = np.full(NS, np.sqrt(1.2) + 0j)
+    E2 = np.full(NS, np.sqrt(0.8) * np.exp(1j * np.pi / 3))
+    D0 = np.full(NS, 1.05)
+    Dg = np.zeros(NS, dtype=complex)
+    G = np.full(NS, OM_NOM) if arm in ("fixed", "plain", "sdcf") else np.zeros(NS)
     
-    Z0 = P0 - 1.0
-    LAM0 = Z0 / (1 + BETA * Z0)
-    C3 = 1.0 / (ALPHA * LAM0)
-
+    ey = es = eys = es2 = np.zeros(NS)
+    aw = DT / TW
+    n = nt // DEC + 1
+    psi_rec = np.zeros((n, NS))
+    ob_rec = np.zeros((n, NS))
+    G_rec = np.zeros((n, NS))
+    
+    psi_old = np.angle(E1 * np.conj(E2))
+    psi_unw = psi_old.copy()
+    
     for k in range(nt):
         t = t_arr[k]
-        I1 = np.abs(E1[k])**2
-        I2 = np.abs(E2[k])**2
-        It = I1 + I2 + EPS
-        x = (I1 - I2) / It
-        tau = t / TS
+        p_val = Pump[k]
+        r = 0.1 if t < T_DRIFT else 0.2
+        s = np.sin(psi_old)
         
-        z = I1 * U ** (tau + c_val * x) + I2 * U ** (tau - c_val * x)
-        lam = z / (1 + BETA * z)
+        if arm == "dither":
+            u = np.full(NS, 4.0 * np.sin(2.0 * np.pi * t / 5.0))
+        elif arm == "const":
+            u = np.full(NS, 4.0)
+        elif arm in ("fixed", "plain", "sdcf"):
+            probe = PROBE_A * np.sin(2.0 * np.pi * t / 5.0) if arm != "fixed" else 0.0
+            u = G * s + probe
+        else:
+            u = np.zeros(NS)
+            
+        if k % DEC == 0:
+            idx = k // DEC
+            psi_rec[idx] = psi_unw
+            ob_rec[idx] = u
+            G_rec[idx] = G
+            
+        Om = omega + u
+        S = (E1, E2, D0, Dg)
         
-        dN_dt = P0 - ALPHA * N[k] * P0 * C3 * lam - N[k]
-        N[k+1] = np.maximum(0, N[k] + dN_dt * DT)
+        # Runge-Kutta 4th Order Integration
+        f = lambda st, tt: plant(tt, *st, p_val, Om, r)
+        add = lambda st, k_, h: tuple(x + h * y for x, y in zip(st, k_))
         
-        omega_bias = BIAS_GAIN * x * lam
-        psi = np.angle(E1[k]) - np.angle(E2[k])
+        k1 = f(S, t)
+        k2 = f(add(S, k1, DT / 2.0), t + DT / 2.0)
+        k3 = f(add(S, k2, DT / 2.0), t + DT / 2.0)
+        k4 = f(add(S, k3, DT), t + DT)
         
-        dE1_dt = 0.5 * (KAPPA * (N[k] - 1.0) + 1j * (ROTATION_RATE + omega_bias)) * E1[k] + BACK_SCATTER * E2[k] * np.exp(1j * psi)
-        dE2_dt = 0.5 * (KAPPA * (N[k] - 1.0) - 1j * (ROTATION_RATE + omega_bias)) * E2[k] + BACK_SCATTER * E1[k] * np.exp(-1j * psi)
+        S = tuple(x + DT / 6.0 * (a1 + 2.0 * a2 + 2.0 * a3 + a4) for x, a1, a2, a3, a4 in zip(S, k1, k2, k3, k4))
+        E1, E2, D0, Dg = S
+        D0 = np.maximum(0, D0.real)
         
-        E1[k+1] = E1[k] + dE1_dt * DT
-        E2[k+1] = E2[k] + dE2_dt * DT
+        sq = 0.03 * np.sqrt(DT)
+        E1 = E1 + sq * (rng.standard_normal(NS) + 1j * rng.standard_normal(NS))
+        E2 = E2 + sq * (rng.standard_normal(NS) + 1j * rng.standard_normal(NS))
+        
+        psi_new = np.angle(E1 * np.conj(E2))
+        dpsi = (psi_new - psi_old + np.pi) % (2.0 * np.pi) - np.pi
+        psi_unw = psi_unw + dpsi
+        
+        if arm in ("plain", "sdcf"):
+            y_sig = dpsi / DT - u
+            ey = ey + aw * (y_sig - ey)
+            es = es + aw * (s - es)
+            eys = eys + aw * (y_sig * s - eys)
+            es2 = es2 + aw * (s * s - es2)
+            
+            var = es2 - es * es
+            cov = eys - ey * es
+            m = np.clip(-cov / np.maximum(var, 1e-9), 0.2 * OM_NOM, 5.0 * OM_NOM)
+            
+            if arm == "plain":
+                G = G + GAMMA * (m - G) * DT
+            else:
+                Pexc = KG * np.maximum(var, 0.0)
+                E = G / OM_NOM
+                lam = np.array([lam_target(mm / OM_NOM) for mm in m])
+                E = E + (Pexc - ALPHA * E * Pexc * C3 * lam) * DT
+                G = E * OM_NOM
+                
+        psi_old = psi_new
+        
+    t_axis = np.arange(n) * DT * DEC
+    out = []
+    for _, a_, b_ in WINS:
+        seg = (t_axis >= a_) & (t_axis < b_)
+        beat = (psi_rec[seg][-1] - psi_rec[seg][0]) / (t_axis[seg][-1] - t_axis[seg][0])
+        est = beat - ob_rec[seg].mean(axis=0) if arm in ("dither", "const") else beat
+        out.append(float(np.abs(est - omega).mean()))
+        
+    return out, float(G_rec[t_axis >= 190].mean())
 
-    return t_arr, np.abs(E1)**2, np.abs(E2)**2, N, np.angle(E1) - np.angle(E2)
 
 if __name__ == "__main__":
-    t, I1, I2, N, psi = run_stress_test(c_val=8.0)
-    beat_frequency = np.gradient(psi, DT)
+    omega = 0.25 * OM_NOM
+    rows = []
+    print(f"true rotation = {omega:.4f} (= 0.25 Omega_L(r=0.1)); numbers below: |reading - rotation| / {OM_NOM:.3f} (0.25 = blind)")
+    header_str = f"{'arm':8s}" + "".join(f"{w[0]:>22s}" for w in WINS) + "   Ghat/0.191 at t~190 (ideal 2.0)"
+    print(header_str)
     
-    print(f"Stress test completed with BACK_SCATTER = {BACK_SCATTER}")
-    print(f"Final Mean Beat Frequency: {np.mean(beat_frequency[50000:]):.4f} (Target: {ROTATION_RATE})")
-
-    # Plot results
-    plt.figure(figsize=(10, 6))
-    plt.subplot(2, 1, 1)
-    plt.plot(t, I1, label="I1 (CW)", color="blue")
-    plt.plot(t, I2, label="I2 (CCW)", color="orange")
-    plt.ylabel("Intensities (Stress Test)")
-    plt.legend()
-    
-    plt.subplot(2, 1, 2)
-    plt.plot(t, beat_frequency, label="Beat Frequency", color="purple")
-    plt.axhline(ROTATION_RATE, color='red', linestyle='--', label=f"Target ({ROTATION_RATE})")
-    plt.ylabel("Frequency")
-    plt.xlabel("Time (s)")
-    plt.legend()
-    
-    plt.tight_layout()
-    plt.show()
+    for arm in ("none", "dither", "const", "fixed", "plain", "sdcf"):
+        err, g = run(arm, omega, 0)
+        row_dict = {"arm": arm}
+        for w, e in zip(WINS, err):
+            row_dict[w[0]] = e / OM_NOM
+        row_dict["Ghat_over_nom"] = g / OM_NOM
+        rows.append(row_dict)
+        
+        row_print = f"{arm:8s}" + "".join(f"{e / OM_NOM:22.3f}" for e in err) + f"   {g / OM_NOM:.2f}"
+        print(row_print, flush=True)
+        
+    pd.DataFrame(rows).to_csv("rlg_adaptive_full_results.csv", index=False)
+    print("\nSimulation complete. Results exported to rlg_adaptive_full_results.csv")
